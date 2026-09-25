@@ -8,6 +8,7 @@ import argparse
 import random
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Set
@@ -36,7 +37,10 @@ class Word:
 def to_hiragana(text: str) -> str:
     """漢字・カタカナをひらがなに変換し、しりとり用に正規化する"""
     result = KAKASI.convert(text)
-    hira = "".join(item["hira"] for item in result)
+    hira = "".join(
+        item.get("hira") or item.get("hiragana") or item.get("kana") or ""
+        for item in result
+    )
 
     # カタカナが残っていた場合の保険
     hira = hira.translate(
@@ -95,44 +99,82 @@ def find_next_words(words: List[Word], last_end: str, used_ids: Set[int]) -> Lis
     return [w for w in words if w.start == last_end and w.id not in used_ids]
 
 
-def auto_chain(words: List[Word], tries: int = 2000) -> List[Word]:
-    """自動で長めのしりとりチェーンを生成する"""
+def _dfs_longest(start: Word, by_start: dict, deadline: float) -> List[Word]:
+    """指定開始点から、時間制限内で最長のチェーンを探す"""
+    path: List[Word] = [start]
+    used: Set[int] = {start.id}
+    best: List[Word] = [start]
+
+    def onward_count(w: Word) -> int:
+        """wの次に進める手の数（Warnsdorff用）"""
+        return sum(
+            1 for x in by_start.get(w.end, []) if x.id not in used and x.id != w.id
+        )
+
+    def dfs(node: Word) -> None:
+        nonlocal best
+        if time.time() > deadline:
+            return
+
+        if len(path) > len(best):
+            best = list(path)
+
+        candidates = [w for w in by_start.get(node.end, []) if w.id not in used]
+        if not candidates:
+            return
+
+        # Warnsdorff順：進める手が少ないものを先に試す
+        candidates.sort(key=onward_count)
+
+        for nxt in candidates:
+            path.append(nxt)
+            used.add(nxt.id)
+            dfs(nxt)
+            used.remove(nxt.id)
+            path.pop()
+
+            if time.time() > deadline:
+                return
+
+    dfs(start)
+    return best
+
+
+def auto_chain(words: List[Word], tries: int = 2000, time_limit: float = 10.0) -> List[Word]:
+    """時間制限つきDFSで最長に近いしりとりチェーンを生成する"""
+    if not words:
+        return []
+
+    # 開始文字ごとの索引
+    by_start: dict[str, List[Word]] = {}
+    for w in words:
+        by_start.setdefault(w.start, []).append(w)
+
+    # 終了文字の出現回数（少ない終わり＝行き止まりになりやすい）
+    end_count: dict[str, int] = {}
+    for w in words:
+        end_count[w.end] = end_count.get(w.end, 0) + 1
+
+    # 行き止まりになりやすい語から優先的に開始点にする
+    starts = sorted(words, key=lambda w: end_count.get(w.end, 0))
+
     best: List[Word] = []
+    deadline = time.time() + time_limit
 
+    # 1) 全開始点からDFS（行き止まり優先順）
+    for start in starts:
+        if time.time() > deadline:
+            break
+        chain = _dfs_longest(start, by_start, deadline)
+        if len(chain) > len(best):
+            best = chain
+
+    # 2) ランダムな開始点からDFS（時間が許す限り）
     for _ in range(tries):
-        unused = {w.id for w in words}
-        current = random.choice(words)
-        chain = [current]
-        unused.remove(current.id)
-        last_end = current.end
-
-        while True:
-            candidates = [
-                w for w in words if w.start == last_end and w.id in unused
-            ]
-            if not candidates:
-                break
-
-            def next_count(w: Word) -> int:
-                return len(
-                    [
-                        x
-                        for x in words
-                        if x.start == w.end and x.id in unused and x.id != w.id
-                    ]
-                )
-
-            candidates.sort(key=next_count)
-            min_count = next_count(candidates[0])
-            best_candidates = [
-                w for w in candidates if next_count(w) == min_count
-            ]
-            nxt = random.choice(best_candidates)
-
-            chain.append(nxt)
-            unused.remove(nxt.id)
-            last_end = nxt.end
-
+        if time.time() > deadline:
+            break
+        start = random.choice(starts)
+        chain = _dfs_longest(start, by_start, deadline)
         if len(chain) > len(best):
             best = chain
 
@@ -231,7 +273,10 @@ def main() -> None:
     sub.add_parser("play", help="対話的にしりとり")
 
     auto_p = sub.add_parser("auto", help="自動でしりとりチェーンを生成")
-    auto_p.add_argument("--tries", type=int, default=2000, help="試行回数")
+    auto_p.add_argument("--tries", type=int, default=2000, help="ランダム試行回数")
+    auto_p.add_argument(
+        "--time-limit", type=float, default=10.0, help="探索の制限時間（秒）"
+    )
 
     val_p = sub.add_parser("validate", help="チェーンファイルを検証")
     val_p.add_argument("file", type=Path, help="検証するチェーンファイル（1行1あだ名）")
@@ -245,11 +290,20 @@ def main() -> None:
     words = load_words(args.data)
     print(f"{len(words)} 件のあだ名を読み込みました。")
 
+    if not words:
+        print(
+            f"あだ名を1件も読み込めませんでした: {args.data}\n"
+            f"ファイルが存在するか、UTF-8で保存されているか、"
+            f"先頭が『番号 スペース あだ名』の形式かを確認してください。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if args.command == "play":
         play(words)
 
     elif args.command == "auto":
-        chain = auto_chain(words, args.tries)
+        chain = auto_chain(words, args.tries, args.time_limit)
         print(f"チェーン長: {len(chain)}")
         for i, w in enumerate(chain, 1):
             print(f"{i} {w.id} {w.text}")
